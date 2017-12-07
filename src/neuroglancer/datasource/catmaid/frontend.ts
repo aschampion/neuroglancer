@@ -38,16 +38,14 @@ interface StackInfo {
     dimension: vec3;
     translation: vec3;
     resolution: vec3;
-    zoomLevels: number; // TODO(adb): zoomLevels = -1 --> downsample until the largest dimension is < 1k
-    id: number;    
-    fileExtension: string; //TODO(adb): enum? 
-    tileHeight: number;
-    tileWidth: number;
-    tileSourceType: number;
-    hostnames: string[];
+    zoomLevels: number;
+    id: number;
+    mirrors: Map<string, StackMirror>;
 }
 
 interface StackMirror {
+    id: number;
+    title: string;
     fileExtension: string;
     tileHeight: number;
     tileWidth: number;
@@ -59,6 +57,7 @@ interface StackMirror {
 interface StackIdentifier {
     id: number;
     title: string;
+    comment: string;
 }
 
 interface ProjectInfo {
@@ -68,64 +67,44 @@ interface ProjectInfo {
 }
 
 function parseStackMirror(obj: any): StackMirror {
+    let id = verifyObjectProperty(obj, 'id', verifyInt);
+    let title = verifyObjectProperty(obj, 'title', verifyString);
     let fileExtension = verifyObjectProperty(obj, 'file_extension', verifyString);
     let tileHeight = verifyObjectProperty(obj, 'tile_height', verifyInt);
     let tileWidth = verifyObjectProperty(obj, 'tile_width', verifyInt);
     let tileSourceType = verifyObjectProperty(obj, 'tile_source_type', verifyInt);
     let url = verifyObjectProperty(obj, 'image_base', verifyString);
     let position = verifyObjectProperty(obj, 'position', verifyInt);
-    
-    return {fileExtension, tileHeight, tileWidth, tileSourceType, url, position};
+
+    return {id, title, fileExtension, tileHeight, tileWidth, tileSourceType, url, position};
 }
 
 function parseStackInfo(obj: any): StackInfo {
     verifyObject(obj);
-        
-    let dimension: vec3 = verifyObjectProperty(obj, 'dimension', dimensionObj => {
-        let x = verifyObjectProperty(dimensionObj, 'x', verifyInt);
-        let y = verifyObjectProperty(dimensionObj, 'y', verifyInt);
-        let z = verifyObjectProperty(dimensionObj, 'z', verifyInt);
-        return vec3.fromValues(x, y, z);
-    });
 
-    let translation: vec3 = verifyObjectProperty(obj, 'translation', translationObj => {
-        let x = verifyObjectProperty(translationObj, 'x', verifyInt);
-        let y = verifyObjectProperty(translationObj, 'y', verifyInt);
-        let z = verifyObjectProperty(translationObj, 'z', verifyInt);
-        return vec3.fromValues(x, y, z);
-    });
+    function verifyObjectVec(obj: any, vecField: string, typeVerifier: (...args: any[]) => number): vec3 {
+        return verifyObjectProperty(obj, vecField, vecObj => {
+            let x = verifyObjectProperty(vecObj, 'x', typeVerifier);
+            let y = verifyObjectProperty(vecObj, 'y', typeVerifier);
+            let z = verifyObjectProperty(vecObj, 'z', typeVerifier);
+            return vec3.fromValues(x, y, z);
+        })
+    }
 
-    let resolution: vec3 = verifyObjectProperty(obj, 'resolution', (resolutionObj => {
-        let x = verifyObjectProperty(resolutionObj, 'x', verifyFloat);
-        let y = verifyObjectProperty(resolutionObj, 'y', verifyFloat);
-        let z = verifyObjectProperty(resolutionObj, 'z', verifyFloat);
-        return vec3.fromValues(x, y, z);
-    }));
+    let dimension = verifyObjectVec(obj, 'dimension', verifyInt);
+    let translation = verifyObjectVec(obj, 'translation', verifyInt);
+    let resolution = verifyObjectVec(obj, 'resolution', verifyFloat);
 
     let zoomLevels = verifyObjectProperty(obj, 'num_zoom_levels', verifyInt);
 
     let id = verifyObjectProperty(obj, 'sid', verifyInt);
-    
-    let stackMirrors = verifyObjectProperty(obj, 'mirrors', mirrorsArrObj => {
-        return parseArray(mirrorsArrObj, parseStackMirror)});
 
-    // TODO(adb): clean this up -- maybe we can sort? 
-    let minPosition = 10000;
-    let stackMirrorIdx = 0;
-    for (let i = 0; i < stackMirrors.length; i++) {
-        if (stackMirrors[i].position < minPosition) {
-            stackMirrorIdx = i;
-            minPosition = stackMirrors[i].position; 
-        }
-    }
-    let stackMirror = stackMirrors[stackMirrorIdx];
-    let fileExtension = stackMirror.fileExtension;
-    let tileHeight = stackMirror.tileHeight;
-    let tileWidth = stackMirror.tileWidth;
-    let tileSourceType = stackMirror.tileSourceType;
-    let hostnames = [stackMirror.url];
+    let mirrors = verifyObjectProperty(obj, 'mirrors', mirrorsArrObj => {
+        return parseArray(mirrorsArrObj, parseStackMirror)
+    }).reduce((mirrors, m) => { mirrors.set(m.id.toString(), m); return mirrors; },
+              new Map<string, StackMirror>());
 
-    return {dimension, translation, resolution, zoomLevels, id, fileExtension, tileHeight, tileWidth, tileSourceType, hostnames};
+    return {dimension, translation, resolution, zoomLevels, id, mirrors};
 }
 
 function parseProjectsList(obj: any): Map<string, ProjectInfo> {
@@ -145,13 +124,14 @@ function parseProjectsList(obj: any): Map<string, ProjectInfo> {
             let stackInfoArr = parseArray(x, stackDescObj => {
                 let id = verifyObjectProperty(stackDescObj, 'id', verifyInt);
                 let title = verifyObjectProperty(stackDescObj, 'title', verifyString);
-                return { id, title };
+                let comment = verifyObjectProperty(stackDescObj, 'comment', verifyString);
+                return { id, title, comment };
             });
             for (let stackInfo of stackInfoArr) {
-                stacks.set(stackInfo.title, stackInfo);
+                stacks.set(stackInfo.id.toString(), stackInfo);
             }
         });
-        projects.set(title, { id, title, stacks });
+        projects.set(id.toString(), { id, title, stacks });
     }
 
     return projects;
@@ -171,14 +151,20 @@ export class MultiscaleTileSource implements GenericMultiscaleVolumeChunkSource 
 
     encoding: TileEncoding;
 
-    constructor(public chunkManager: ChunkManager, public url: string, public projectInfo: ProjectInfo, public stackInfo: StackInfo, public parameters: {[index: string]: any} = {}) {
+    constructor(
+            public chunkManager: ChunkManager,
+            public url: string,
+            // public projectInfo: ProjectInfo,
+            public stackInfo: StackInfo,
+            public mirrorId: string,
+            public parameters: {[index: string]: any} = {}) {
 
-        if (projectInfo === undefined) {
-            throw new Error(`Failed to read project information from CATMAID`);
-        }
+        // if (projectInfo === undefined) {
+        //     throw new Error(`Failed to read project information from CATMAID`);
+        // }
 
         if (stackInfo === undefined) {
-            throw new Error(`Failed to read stack information for project ${projectInfo.title} from CATMAID.`);
+            throw new Error(`Failed to read stack information for stack from CATMAID.`);
         }
 
         this.encoding = TileEncoding.JPEG;
@@ -186,10 +172,21 @@ export class MultiscaleTileSource implements GenericMultiscaleVolumeChunkSource 
 
     getSources(volumeSourceOptions: VolumeSourceOptions) {
         let sources: VolumeChunkSource[][] = [];
+        let mirror = this.stackInfo.mirrors.get(this.mirrorId);
+        if (mirror === undefined) {
+            throw new Error(`Unable to find mirror ${this.mirrorId} for stack`);
+        }
 
         let numLevels = this.stackInfo.zoomLevels;
 
-        for (let level = 0; level < numLevels; level++) {
+        // Zoom level of -1 indicates the maximum zoom level is such that the
+        // XY-extents of the stack at that level are less than 1K.
+        if (numLevels < 0) {
+            numLevels = Math.ceil(Math.max(Math.log2(this.stackInfo.dimension[0] / 1024),
+                                           Math.log2(this.stackInfo.dimension[1] / 1024)));
+        }
+
+        for (let level = 0; level <= numLevels; level++) {
             let voxelSize = vec3.clone(this.stackInfo.resolution);
             let chunkDataSize = vec3.fromValues(1, 1, 1);
 
@@ -197,15 +194,15 @@ export class MultiscaleTileSource implements GenericMultiscaleVolumeChunkSource 
                 voxelSize[i] = voxelSize[i] * Math.pow(2, level);
             }
 
-            chunkDataSize[0] = this.stackInfo.tileWidth;
-            chunkDataSize[1] = this.stackInfo.tileHeight;
+            chunkDataSize[0] = mirror.tileWidth;
+            chunkDataSize[1] = mirror.tileHeight;
 
-            let lowerVoxelBound = vec3.create(), upperVoxelBound = vec3.create();
+            let lowerVoxelBound = vec3.create(), upperVoxelBound = vec3.clone(this.stackInfo.dimension);
 
-            for(let i=0; i<3; i++) {
-                lowerVoxelBound[i] = Math.floor(this.stackInfo.translation[i] * (this.stackInfo.resolution[i] / voxelSize[i]));
-                upperVoxelBound[i] = Math.ceil((this.stackInfo.dimension[i] + this.stackInfo.translation[i]) * (this.stackInfo.resolution[i] / voxelSize[i]));
-            }
+            // for(let i=0; i<3; i++) {
+            //     lowerVoxelBound[i] = Math.floor(this.stackInfo.translation[i] / voxelSize[i]);
+            //     upperVoxelBound[i] = Math.ceil((this.stackInfo.dimension[i] * this.stackInfo.resolution[i] + this.stackInfo.translation[i]) / voxelSize[i]);
+            // }
 
             let spec = VolumeChunkSpecification.make({
                 voxelSize,
@@ -220,17 +217,18 @@ export class MultiscaleTileSource implements GenericMultiscaleVolumeChunkSource 
             let source = this.chunkManager.getChunkSource(CatmaidTileSource, {
                 spec,
                 parameters: {
-                    'sourceBaseUrls': this.stackInfo.hostnames,
+                    'sourceBaseUrls': mirror.url,
                     'encoding': this.encoding,
                     'zoomLevel': level,
-                    'tileHeight': this.stackInfo.tileHeight,
-                    'tileWidth': this.stackInfo.tileWidth
+                    'tileHeight': mirror.tileHeight,
+                    'tileWidth': mirror.tileWidth,
+                    'tileSourceType': mirror.tileSourceType,
                 }
             });
 
             sources.push([source]);
         }
-        return sources;        
+        return sources;
     }
 
     /**
@@ -242,7 +240,7 @@ export class MultiscaleTileSource implements GenericMultiscaleVolumeChunkSource 
 }
 
 export function getVolume(chunkManager: ChunkManager, path: string) {
-    const urlPatternComplete = /^((?:http|https):\/\/[^?]+)\/(.*)\/(.*)$/;
+    const urlPatternComplete = /^((?:http|https):\/\/[^?]+)\/(.*)\/(.*)\/(.*)$/;
     let match = path.match(urlPatternComplete);
 
     if (match === null) {
@@ -252,89 +250,142 @@ export function getVolume(chunkManager: ChunkManager, path: string) {
     const url = match[1];
     const project = match[2];
     const stack = match[3];
+    const mirror = match[4];
 
     // TODO(adb): support parameters
     // const parameters = parseQueryStringParameters(match[4] || '');
-    
-    return chunkManager.memoize.getUncounted({ type: 'catmaid:MultiscaleVolumeChunkSource', url, path }, () => getProjectsList(chunkManager, [url]).then(projectsList => {
-        let projectInfo = projectsList.get(project);
-        if (projectInfo === undefined) {
-            throw new Error(`Unable to find project ${project} in projects list`);
-        }
 
-        let stackIdentifier = projectInfo.stacks.get(stack);
-        if (stackIdentifier === undefined) {
-            throw new Error(`Unable to find stack ${stack} in project ${project}`);
-        }
-        return getStackInfo(chunkManager, url, projectInfo.id, stackIdentifier.id).then(stackInfo => { return new MultiscaleTileSource(chunkManager, url, projectInfo!,stackInfo)});
+    return chunkManager.memoize.getUncounted(
+                { type: 'catmaid:MultiscaleVolumeChunkSource', url, path },
+                () => getStackInfo(chunkManager, url, Number(project), Number(stack)).then(stackInfo => {
+                    return new MultiscaleTileSource(chunkManager, url, stackInfo, mirror);
+                }));
+    //             () => getProjectsList(chunkManager, [url]).then(projectsList => {
+    //     let projectInfo = projectsList.get(project);
+    //     if (projectInfo === undefined) {
+    //         throw new Error(`Unable to find project ${project} in projects list`);
+    //     }
 
-    }));
+    //     let stackIdentifier = projectInfo.stacks.get(stack);
+    //     if (stackIdentifier === undefined) {
+    //         throw new Error(`Unable to find stack ${stack} in project ${project}`);
+    //     }
+    //     return getStackInfo(chunkManager, url, projectInfo.id, stackIdentifier.id)
+    //         .then(stackInfo => { return new MultiscaleTileSource(chunkManager, url, projectInfo!, stackInfo) });
+
+    // }));
 }
 
 export function getStackInfo(chunkManager: ChunkManager, hostname: string, projectId: number, stackId: number) {
-    return chunkManager.memoize.getUncounted({ type: 'catmaid:getStackInfo', hostname, projectId, stackId }, () => sendHttpRequest(openShardedHttpRequest(hostname, `/${projectId}/stack/${stackId}/info`), 'json').then(parseStackInfo));
+    return chunkManager.memoize.getUncounted(
+            { type: 'catmaid:getStackInfo', hostname, projectId, stackId },
+            () => sendHttpRequest(openShardedHttpRequest(hostname, `/${projectId}/stack/${stackId}/info`), 'json')
+        .then(parseStackInfo));
 }
 
 // TODO(adb): refactor this to take hostnames and a post path, so we can separate out the base hostname from the server(s) and any prefix (which we will need later)
 export function getProjectsList(chunkManager: ChunkManager, hostnames: string[]) {
-    return chunkManager.memoize.getUncounted({ type: 'catmaid:getProjectsList', hostnames }, () => sendHttpRequest(openShardedHttpRequest(hostnames, `/projects/`), 'json').then(parseProjectsList));
+    return chunkManager.memoize.getUncounted(
+            { type: 'catmaid:getProjectsList', hostnames },
+            () => sendHttpRequest(openShardedHttpRequest(hostnames, `/projects/`), 'json')
+        .then(parseProjectsList));
 }
 
-export function autoCompleteProject(projectTitlePartial: string, url: string, projectsList: Map<string, ProjectInfo>) {
-    console.log(url);
-    let completions = getPrefixMatchesWithDescriptions(projectTitlePartial, projectsList, x => x[0] + '/', () => undefined);
-    return { offset: 0, completions };
+export function autoCompleteProject(projectIdPartial: string, offset: number, projectsList: Map<string, ProjectInfo>) {
+    let completions = getPrefixMatchesWithDescriptions(
+            projectIdPartial,
+            projectsList.values(),
+            x => x.id + '/',
+            x => x.title);
+    return { offset: offset, completions };
 }
 
-export function autoCompleteStack(stackTitlePartial: string, projectTitle: string, url: string, projectsList: Map<string, ProjectInfo>) {
-    console.log(url);
-
-    let projectInfo = projectsList.get(projectTitle);
+export function autoCompleteStack(stackIdPartial: string, projectId: string, offset:number, projectsList: Map<string, ProjectInfo>) {
+    let projectInfo = projectsList.get(projectId);
     if (projectInfo === undefined) {
-        throw new Error(`Unable to find project ${projectTitle} in projects list`);
+        throw new Error(`Unable to find project ${projectId} in projects list`);
     }
 
-    let completions = getPrefixMatchesWithDescriptions(stackTitlePartial, projectInfo.stacks, x => x[0], x => { return `${x[1].title}`; });
-    return { offset: projectTitle.length + 1, completions };
+    let completions = getPrefixMatchesWithDescriptions(
+            stackIdPartial,
+            projectInfo.stacks.values(),
+            x => x.id.toString() + '/',
+            x => `${x.title}: ${x.comment}`);
+    return { offset: offset, completions };
 }
 
-export function projectAndStackCompleter(chunkManager: ChunkManager, hostnames: string[], path: string) {
+export function autoCompleteMirror(mirrorIdPartial: string, offset: number, mirrorsList: Map<string, StackMirror>) {
+    let completions = getPrefixMatchesWithDescriptions(
+            mirrorIdPartial,
+            [...mirrorsList.values()].sort((a, b) => a.position - b.position),
+            x => x.id.toString(),
+            x => `${x.title}`);
+    return { offset: offset, completions };
+}
+
+export function projectStackMirrorCompleter(chunkManager: ChunkManager, hostnames: string[], path: string) {
     let pathSplit = path.split('/');
-    if (pathSplit.length > 1) {
-        let pathTmp = pathSplit;
-        let stackTitle = pathTmp.pop();
-        let projectTitle = pathTmp.pop();
 
-        if (projectTitle === undefined) {
-            return Promise.reject<CompletionResult>(null);
-        }
+    let projectId = pathSplit.pop(), stackId = '', mirrorId = '';
+    let url = [hostnames[0]].concat(pathSplit).join('/');
+    let offset = path.length - projectId!.length;
+    return getProjectsList(chunkManager, [url])
+            .then(projectsList => { return autoCompleteProject(projectId!, offset, projectsList); })
+            .catch(projectError => {
+                if (pathSplit.length) {
+                    stackId = projectId!;
+                    projectId = pathSplit.pop();
+                    url = [hostnames[0]].concat(pathSplit).join('/');
 
-        let url = hostnames[0] +  '/' + pathTmp.join();
-        if (stackTitle === undefined) {
-            // Try and autocomplete the project
-            return getProjectsList(chunkManager, [url]).then(projectsList => { return autoCompleteProject(projectTitle!, url, projectsList); });
-        }
+                    return getProjectsList(chunkManager, [url])
+                        .then(projectsList => { return autoCompleteStack(stackId!, projectId!, offset, projectsList); })
+                        .catch(stackError => {
+                            if (pathSplit.length) {
+                                mirrorId = stackId;
+                                stackId = projectId!;
+                                projectId = pathSplit.pop();
+                                url = [hostnames[0]].concat(pathSplit).join('/');
 
-        return getProjectsList(chunkManager, [url]).then(projectsList => { return autoCompleteStack(stackTitle!, projectTitle!, url, projectsList); });
+                                return getStackInfo(chunkManager, url, Number(projectId), Number(stackId))
+                                    .then(stackInfo => { return autoCompleteMirror(mirrorId!, offset, stackInfo.mirrors); });
+                            } else {
+                                throw stackError;
+                            }
+                        });
+                } else {
+                    throw projectError;
+                }
+            });
 
-    } else {
-        // Try and complete the project with the base URL
-        let url = hostnames[0];
-        /*
-        if (path.length > 0) {
-            url = url + '/' + path;
-        }
-        */
-        return getProjectsList(chunkManager, [url]).then(projectsList => {
-            return autoCompleteProject("", url, projectsList);
-        });
-    }
+    // switch (pathSplit.length) {
+    //     case 1: {
+    //         let [projectId] = pathSplit;
+    //         let url = hostnames[0];
+    //         return getProjectsList(chunkManager, [url])
+    //             .then(projectsList => { return autoCompleteProject(projectId!, url, projectsList); });
+    //     }
+    //     case 2: {
+    //         let [projectId, stackId] = pathSplit;
+    //         let url = hostnames[0];
+    //         return getProjectsList(chunkManager, [url])
+    //             .then(projectsList => { return autoCompleteStack(stackId!, projectId!, url, projectsList); });
+    //     }
+    //     default: {
+    //         let mirrorId = pathSplit.pop();
+    //         let stackId = pathSplit.pop();
+    //         let projectId = pathSplit.pop();
+    //         let url = [hostnames[0]].concat(pathSplit).join('/');
+    //         return getStackInfo(chunkManager, url, Number(projectId), Number(stackId))
+    //             .then(stackInfo => { return autoCompleteMirror(mirrorId!, stackId!, projectId!, stackInfo.mirrors); });
+    //     }
+    // }
 }
 
 export class CatmaidDataSource extends DataSource {
     get description() {
         return 'Catmaid';
     }
+
     getVolume(chunkManager: ChunkManager, url: string) {
         return getVolume(chunkManager, url);
     }
@@ -348,7 +399,8 @@ export class CatmaidDataSource extends DataSource {
         }
         let hostnamesBase = [match[1]];
         let path = match[2];
-        return projectAndStackCompleter(chunkManager, hostnamesBase, path).then(completions => applyCompletionOffset(match![1].length + 1, completions));
+        return projectStackMirrorCompleter(chunkManager, hostnamesBase, path)
+            .then(completions => applyCompletionOffset(match![1].length + 1, completions));
     }
 
     getSkeletonSourceParameters(chunkManager: ChunkManager, url: string): Promise<SkeletonSourceParameters> {
@@ -363,7 +415,7 @@ export class CatmaidDataSource extends DataSource {
         if (project === undefined) {
             throw new Error(`No Catmaid project specified.`);
         }
-        
+
         console.log(hostname);
         return getProjectsList(chunkManager, [hostname]).then(projectsList => {
             let projectInfo = projectsList.get(project);

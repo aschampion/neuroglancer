@@ -31,6 +31,7 @@ export class TileSourceParameters {
   zoomLevel: number;
   tileWidth: number;
   tileHeight: number;
+  tileSourceType: number;
   // TODO(adb): fileExtension: string;
   // TODO(adb): tile source
   

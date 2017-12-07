@@ -46,7 +46,17 @@ export class CatmaidTileSource extends (WithParameters(VolumeChunkSource, TileSo
         // TODO(adb): check source base url for slash in frontend
 
         // TODO(adb): read tile extension from stack mirror
-        let path = `${parameters.zoomLevel}/${chunkGridPosition[2]}/${chunkGridPosition[1]}/${chunkGridPosition[0]}.jpg`
+        let path = '';
+        switch (parameters.tileSourceType) {
+          case 4:
+            path = `${chunkGridPosition[2]}/${parameters.zoomLevel}/${chunkGridPosition[1]}_${chunkGridPosition[0]}.jpg`;
+            break;
+          case 5:
+            path = `${parameters.zoomLevel}/${chunkGridPosition[2]}/${chunkGridPosition[1]}/${chunkGridPosition[0]}.jpg`;
+            break;
+          default:
+            throw new Error(`Unsupported tile source type: ${parameters.tileSourceType}`);
+        }
 
         return sendHttpRequest(openShardedHttpRequest(parameters.sourceBaseUrls, path), 'arraybuffer', cancellationToken).then(response => chunkDecoder(chunk, response));
     }
